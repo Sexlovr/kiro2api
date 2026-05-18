@@ -1,10 +1,10 @@
 import express from 'express';
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4 } from 'url';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import logger from './utils/logger.js';
 import { getAccountPool } from './pool/account-pool.js';
-import { KIRO_FREE_MODELS, KIRO_PAID_MODELS, KIRO_ALL_MODELS } from './providers/claude-kiro.js';
+import { KIRO_FREE_MODELS, KIRO_PAID_MODELS, KIRO_ALL_MODELS, KiroApiService } from './providers/claude-kiro.js';
 import { KiroApiError } from './providers/kiro-error.js';
 import { toClaudeRequestFromOpenAI, toOpenAIChatCompletionFromClaude, ClaudeToOpenAIStreamAdapter } from './convert/convert.js';
 import { handleKiroOAuth, batchImportRefreshTokens, importAwsCredentials } from './auth/kiro-oauth.js';
@@ -57,7 +57,6 @@ function identifyUser(req) {
 // Public routes
 // =============================================================================
 
-// Health check
 app.get('/', (req, res) => {
     const pool = getAccountPool();
     res.json({
@@ -68,7 +67,6 @@ app.get('/', (req, res) => {
     });
 });
 
-// Models — JSON (public)
 app.get('/v1/models', (req, res) => {
     const models = KIRO_ALL_MODELS.map(id => ({
         id, object: 'model', created: 1700000000, owned_by: 'kiro-proxy',
@@ -76,7 +74,6 @@ app.get('/v1/models', (req, res) => {
     res.json({ object: 'list', data: models });
 });
 
-// Models — UI page (public)
 app.get('/ui/models', (req, res) => {
     res.send(modelsPage());
 });
@@ -89,6 +86,8 @@ app.get('/ui/models', (req, res) => {
 app.post('/v1/chat/completions', requireApiKey, async (req, res) => {
     const user = identifyUser(req);
     recordRequest(user);
+
+    let streamStarted = false;
 
     try {
         const claudeRequest = toClaudeRequestFromOpenAI(req.body);
@@ -104,6 +103,7 @@ app.post('/v1/chat/completions', requireApiKey, async (req, res) => {
                 res.setHeader('Cache-Control', 'no-cache');
                 res.setHeader('Connection', 'keep-alive');
                 res.setHeader('X-Accel-Buffering', 'no');
+                streamStarted = true;
 
                 const adapter = new ClaudeToOpenAIStreamAdapter(req.body.model || model);
 
@@ -128,7 +128,26 @@ app.post('/v1/chat/completions', requireApiKey, async (req, res) => {
         }
     } catch (error) {
         recordError();
-        handleApiError(res, error);
+        // BUG FIX: If SSE headers already sent, we cannot send a JSON error.
+        // Write an SSE-formatted error and close the stream instead.
+        if (streamStarted && res.headersSent) {
+            const errPayload = {
+                id: `chatcmpl-${uuidv4()}`,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: req.body?.model || 'unknown',
+                choices: [{
+                    index: 0,
+                    delta: { content: `\n\n[Error: ${error.message}]` },
+                    finish_reason: 'stop',
+                }],
+            };
+            res.write(`data: ${JSON.stringify(errPayload)}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+        } else {
+            handleApiError(res, error);
+        }
     }
 });
 
@@ -136,6 +155,8 @@ app.post('/v1/chat/completions', requireApiKey, async (req, res) => {
 app.post('/v1/messages', requireApiKey, async (req, res) => {
     const user = identifyUser(req);
     recordRequest(user);
+
+    let streamStarted = false;
 
     try {
         const model = req.body.model || 'claude-sonnet-4-5';
@@ -149,6 +170,7 @@ app.post('/v1/messages', requireApiKey, async (req, res) => {
                 res.setHeader('Cache-Control', 'no-cache');
                 res.setHeader('Connection', 'keep-alive');
                 res.setHeader('X-Accel-Buffering', 'no');
+                streamStarted = true;
 
                 for await (const event of account.service.generateContentStream(model, req.body)) {
                     res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
@@ -167,13 +189,22 @@ app.post('/v1/messages', requireApiKey, async (req, res) => {
         }
     } catch (error) {
         recordError();
-        handleApiError(res, error);
+        // BUG FIX: Same streaming error handling for Claude native endpoint
+        if (streamStarted && res.headersSent) {
+            const errEvent = {
+                type: 'error',
+                error: { type: 'server_error', message: error.message },
+            };
+            res.write(`event: error\ndata: ${JSON.stringify(errEvent)}\n\n`);
+            res.end();
+        } else {
+            handleApiError(res, error);
+        }
     }
 });
 
-// POST /v1/messages/count_tokens
+// BUG FIX: Use already-imported KiroApiService instead of require() (ESM doesn't support require)
 app.post('/v1/messages/count_tokens', requireApiKey, (req, res) => {
-    const { KiroApiService } = require('./providers/claude-kiro.js');
     res.json(KiroApiService.countTokens(req.body));
 });
 
@@ -181,28 +212,23 @@ app.post('/v1/messages/count_tokens', requireApiKey, (req, res) => {
 // Admin routes (protected by admin password)
 // =============================================================================
 
-// Stats
 app.get('/admin/stats', requireAdmin, (req, res) => {
     const pool = getAccountPool();
     res.json({ stats: getStats(), accounts: pool.getStatuses() });
 });
 
-// Account statuses
 app.get('/admin/accounts', requireAdmin, (req, res) => {
     res.json({ accounts: getAccountPool().getStatuses() });
 });
 
-// Export credentials as JSON
 app.get('/admin/credentials/export', requireAdmin, (req, res) => {
     res.json({ credentials: getAccountPool().exportAllCredentials() });
 });
 
-// Export credentials as base64
 app.get('/admin/credentials/export-base64', requireAdmin, (req, res) => {
     res.json({ base64: getAccountPool().exportAllCredentialsBase64() });
 });
 
-// Import single credential
 app.post('/admin/credentials/import', requireAdmin, async (req, res) => {
     try {
         const result = await importAwsCredentials(req.body);
@@ -212,7 +238,6 @@ app.post('/admin/credentials/import', requireAdmin, async (req, res) => {
     }
 });
 
-// Batch import refresh tokens
 app.post('/admin/credentials/batch-import', requireAdmin, async (req, res) => {
     try {
         const tokens = req.body.refreshTokens || [];
@@ -224,7 +249,6 @@ app.post('/admin/credentials/batch-import', requireAdmin, async (req, res) => {
     }
 });
 
-// OAuth start
 app.post('/auth/kiro/oauth', requireAdmin, async (req, res) => {
     try {
         const result = await handleKiroOAuth(req.body);
@@ -234,7 +258,6 @@ app.post('/auth/kiro/oauth', requireAdmin, async (req, res) => {
     }
 });
 
-// Force refresh all accounts
 app.post('/admin/refresh-all', requireAdmin, async (req, res) => {
     const pool = getAccountPool();
     const statuses = pool.getStatuses();
@@ -250,21 +273,19 @@ app.post('/admin/refresh-all', requireAdmin, async (req, res) => {
     res.json({ refreshed, total: statuses.length });
 });
 
-// Rescan configs directory
 app.post('/admin/rescan', requireAdmin, async (req, res) => {
     const added = await getAccountPool().scanAndLoadNew();
     res.json({ added, total: getAccountPool().getAccountCount() });
 });
 
 // =============================================================================
-// Admin UI page
+// Admin UI pages
 // =============================================================================
 
 app.get('/ui/admin', (req, res) => {
     res.send(adminPage());
 });
 
-// Auth UI page
 app.get('/ui/auth', (req, res) => {
     res.send(authPage());
 });
@@ -274,6 +295,12 @@ app.get('/ui/auth', (req, res) => {
 // =============================================================================
 
 function handleApiError(res, error) {
+    // Guard: never try to send after headers are already flushed
+    if (res.headersSent) {
+        logger.error(`[API] Error after headers sent (swallowed): ${error.message}`);
+        return;
+    }
+
     if (error instanceof KiroApiError) {
         const status = error.statusCode || 500;
         logger.error(`[API] KiroApiError: ${error.message} (${error.errorType})`);
@@ -299,7 +326,7 @@ function modelsPage() {
     return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kiro2 API — Models</title>
 
-<!--LUMIVERSE_HTML_ISLAND_1-->
+<!--LUMIVERSE_HTML_ISLAND_0-->
 
 function copy(t){navigator.clipboard.writeText(t);const e=document.getElementById('toast');e.style.display='block';setTimeout(()=>e.style.display='none',1500)}
 </script></body></html>`;
@@ -309,7 +336,7 @@ function adminPage() {
     return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kiro2 API — Admin</title>
 
-<!--LUMIVERSE_HTML_ISLAND_2-->
+<!--LUMIVERSE_HTML_ISLAND_1-->
 
 let pwd='';
 function login(){pwd=document.getElementById('pwd').value;fetch('/admin/stats?password='+pwd).then(r=>{if(!r.ok)throw new Error();return r.json()}).then(()=>{document.getElementById('loginBox').style.display='none';document.getElementById('panel').style.display='block';loadData()}).catch(()=>toast('Wrong password','#f85149'))}
@@ -341,7 +368,7 @@ function authPage() {
     return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kiro2 API — Auth</title>
 
-<!--LUMIVERSE_HTML_ISLAND_3-->
+<!--LUMIVERSE_HTML_ISLAND_2-->
 
 let pwd='';
 function login(){pwd=document.getElementById('pwd').value;fetch('/admin/stats',{headers:{Authorization:'Bearer '+pwd}}).then(r=>{if(!r.ok)throw new Error();document.getElementById('loginBox').style.display='none';document.getElementById('methods').style.display='block'}).catch(()=>{alert('Wrong password')})}
@@ -367,10 +394,8 @@ async function main() {
     logger.info('  Kiro2 API — Starting up');
     logger.info('='.repeat(50));
 
-    // Load persistent stats
     await loadStats();
 
-    // Initialize account pool
     const pool = getAccountPool();
     await pool.initialize();
 
