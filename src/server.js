@@ -7,7 +7,7 @@ import { getAccountPool } from './pool/account-pool.js';
 import { KIRO_FREE_MODELS_FULL, KIRO_PAID_MODELS_FULL, KIRO_ALL_MODELS, KiroApiService } from './providers/claude-kiro.js';
 import { KiroApiError } from './providers/kiro-error.js';
 import { toClaudeRequestFromOpenAI, toOpenAIChatCompletionFromClaude, ClaudeToOpenAIStreamAdapter } from './convert/convert.js';
-import { handleKiroOAuth, batchImportRefreshTokens, importAwsCredentials, exchangeOAuthCode } from './auth/kiro-oauth.js';
+import { handleKiroOAuth, batchImportRefreshTokens, importAwsCredentials } from './auth/kiro-oauth.js';
 import { recordRequest, recordError, getStats, loadStats, saveStats } from './tracking/stats.js';
 import { buildMainPage, buildModelsPage } from './pages.js';
 
@@ -169,17 +169,6 @@ app.post('/auth/kiro/oauth', requireAdmin, async function(req, res) {
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Exchange pasted redirect URL for Google/GitHub social OAuth
-app.post('/auth/kiro/exchange', requireAdmin, async function(req, res) {
-    try {
-        var redirectUrl = req.body.redirectUrl || req.body.url || '';
-        var result = await exchangeOAuthCode(redirectUrl);
-        res.json(result);
-    } catch (e) {
-        res.status(400).json({ success: false, error: e.message });
-    }
-});
-
 app.post('/admin/refresh-all', requireAdmin, async function(req, res) {
     var pool = getAccountPool();
     var refreshed = 0;
@@ -216,8 +205,7 @@ app.post('/admin/account/:id/health-check', requireAdmin, async function(req, re
 });
 
 app.post('/admin/check-all-credits', requireAdmin, async function(req, res) {
-    var results = await getAccountPool().checkAllCredits();
-    res.json({ results: results });
+    res.json({ results: await getAccountPool().checkAllCredits() });
 });
 
 app.get('/admin/settings/api-key', requireAdmin, function(req, res) {
@@ -226,9 +214,9 @@ app.get('/admin/settings/api-key', requireAdmin, function(req, res) {
 
 app.post('/admin/settings/api-key', requireAdmin, function(req, res) {
     var newKey = req.body.apiKey;
-    if (!newKey || newKey.length < 4) return res.status(400).json({ error: 'API key must be at least 4 characters' });
+    if (!newKey || newKey.length < 4) return res.status(400).json({ error: 'Min 4 chars' });
     runtimeApiKey = newKey;
-    logger.info('[Admin] API key changed at runtime');
+    logger.info('[Admin] API key changed');
     res.json({ success: true, apiKey: runtimeApiKey });
 });
 
