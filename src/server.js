@@ -204,6 +204,11 @@ app.post('/admin/account/:id/health-check', requireAdmin, async function(req, re
     res.json(await getAccountPool().healthCheck(req.params.id));
 });
 
+app.post('/admin/check-all-credits', requireAdmin, async function(req, res) {
+    var results = await getAccountPool().checkAllCredits();
+    res.json({ results: results });
+});
+
 app.get('/admin/settings/api-key', requireAdmin, function(req, res) {
     res.json({ apiKey: runtimeApiKey });
 });
