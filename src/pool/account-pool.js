@@ -8,6 +8,7 @@ import crypto from 'crypto';
 var STATUS = { HEALTHY: 'healthy', REFRESHING: 'refreshing', UNHEALTHY: 'unhealthy', COOLDOWN: 'cooldown', DISABLED: 'disabled' };
 var COOLDOWN_MS = { RATE_LIMIT: 30000, SERVER: 10000 };
 var FREE_TIER_DEFAULT_LIMIT = 50;
+var CREDIT_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 class AccountPool {
     constructor(config) {
@@ -18,6 +19,7 @@ class AccountPool {
         this.refreshIntervalMs = config.tokenRefreshIntervalMs || parseInt(process.env.KIRO_TOKEN_REFRESH_INTERVAL_MS, 10) || 45 * 60 * 1000;
         this.configsDir = config.configsDir || path.join(baseDir, 'configs', 'kiro');
         this._keepAliveRunning = false;
+        this._creditCheckTimer = null;
     }
 
     async initialize() {
@@ -27,7 +29,13 @@ class AccountPool {
         var total = this.accounts.length;
         var healthy = this.accounts.filter(function(a) { return a.status === STATUS.HEALTHY; }).length;
         logger.info('[Pool] Initialized: ' + total + ' account(s), ' + healthy + ' healthy. Dir: ' + this.configsDir);
-        if (total > 0) this.startKeepAlive();
+        if (total > 0) {
+            this.startKeepAlive();
+            this._startCreditCheckTimer();
+            // Initial credit check after 10 seconds (let tokens settle first)
+            var self = this;
+            setTimeout(function() { self.checkAllCredits().catch(function(e) { logger.warn('[Pool] Initial credit check failed: ' + e.message); }); }, 10000);
+        }
     }
 
     async _ensureConfigsDir() { try { await fs.mkdir(this.configsDir, { recursive: true }); } catch (e) {} }
@@ -79,7 +87,7 @@ class AccountPool {
                 if (credPath && !existingPaths.has(credPath)) { await this.addAccountFromFile(credPath); added++; }
             } catch (e) {}
         }
-        if (added > 0) logger.info('[Pool] Scan found ' + added + ' new account(s)');
+        if (added > 0) logger.info('[Pool] Scan found ' + added + ' new');
         return added;
     }
 
@@ -93,8 +101,9 @@ class AccountPool {
             var baseDir = process.env.DATA_DIR || process.cwd();
             logger.info('[Pool] Added account ' + account.id + ' from ' + path.relative(baseDir, credPath));
             if (this._keepAliveRunning) this._startAccountRefreshTimer(account);
+            if (!this._creditCheckTimer) this._startCreditCheckTimer();
             return account.id;
-        } catch (error) { logger.error('[Pool] Failed to add from ' + credPath + ': ' + error.message); return null; }
+        } catch (error) { logger.error('[Pool] Failed: ' + credPath + ': ' + error.message); return null; }
     }
 
     async addAccountFromBase64(base64String, sourceLabel) {
@@ -109,7 +118,7 @@ class AccountPool {
         try {
             var credPath = await this._saveCredsToDisk(credentials);
             return await this.addAccountFromFile(credPath);
-        } catch (error) { logger.error('[Pool] Failed from credentials: ' + error.message); return null; }
+        } catch (error) { logger.error('[Pool] Failed: ' + error.message); return null; }
     }
 
     async _saveCredsToDisk(credentials) {
@@ -124,100 +133,66 @@ class AccountPool {
 
     _createAccountEntry(service, credPath, label) {
         return {
-            id: crypto.randomBytes(4).toString('hex'),
-            label: label || 'unknown', service: service, credPath: credPath,
-            status: STATUS.HEALTHY, activeRequests: 0, lastError: null,
-            lastUsedAt: null, createdAt: new Date().toISOString(),
-            refreshTimer: null, totalRequests: 0, totalErrors: 0, lastUsage: null,
+            id: crypto.randomBytes(4).toString('hex'), label: label || 'unknown',
+            service: service, credPath: credPath, status: STATUS.HEALTHY,
+            activeRequests: 0, lastError: null, lastUsedAt: null,
+            createdAt: new Date().toISOString(), refreshTimer: null,
+            totalRequests: 0, totalErrors: 0, lastUsage: null,
         };
     }
 
     _extractCredits(result) {
-        var used = 0;
-        var limit = 0;
+        logger.info('[Pool] Raw usage response: ' + JSON.stringify(result));
 
-        logger.info('[Pool] Raw AWS Usage Payload: ' + JSON.stringify(result));
+        if (!result || typeof result !== 'object') return { used: 0, limit: FREE_TIER_DEFAULT_LIMIT };
 
-        if (!result || typeof result !== 'object') {
-            return { used: 0, limit: FREE_TIER_DEFAULT_LIMIT };
-        }
-
-        // Collect all candidate number fields from every level
         var usedCandidates = [];
         var limitCandidates = [];
 
-        var collectFromObj = function(obj) {
-            if (!obj || typeof obj !== 'object') return;
+        var hunt = function(obj, depth) {
+            if (!obj || typeof obj !== 'object' || depth > 5) return;
+            if (Array.isArray(obj)) {
+                for (var i = 0; i < obj.length; i++) hunt(obj[i], depth + 1);
+                return;
+            }
             var keys = Object.keys(obj);
-            for (var i = 0; i < keys.length; i++) {
-                var k = keys[i].toLowerCase();
-                var v = obj[keys[i]];
+            for (var k = 0; k < keys.length; k++) {
+                var key = keys[k].toLowerCase();
+                var val = obj[keys[k]];
+                var num = Number(val);
 
-                // Used count fields
-                if (k === 'usedcount' || k === 'used' || k === 'currentusage' || k === 'usagecount' || k === 'consumed' || k === 'requestcount') {
-                    if (typeof v === 'number' || typeof v === 'string') usedCandidates.push(Number(v));
+                if ((key.indexOf('used') !== -1 || key.indexOf('current') !== -1 || key.indexOf('consumed') !== -1 || key.indexOf('count') !== -1) && key.indexOf('limit') === -1 && key.indexOf('max') === -1 && key.indexOf('total') === -1 && key.indexOf('allowed') === -1) {
+                    if (!isNaN(num)) usedCandidates.push(num);
                 }
-                // Limit count fields
-                if (k === 'limitcount' || k === 'limit' || k === 'max' || k === 'maxusage' || k === 'maxcount' || k === 'allowedcount' || k === 'totalcount' || k === 'quota' || k === 'maxrequests' || k === 'totallimit') {
-                    if (typeof v === 'number' || typeof v === 'string') limitCandidates.push(Number(v));
+                if (key.indexOf('limit') !== -1 || key.indexOf('max') !== -1 || key.indexOf('allowed') !== -1 || key.indexOf('quota') !== -1 || key.indexOf('total') !== -1) {
+                    if (key.indexOf('used') === -1 && key.indexOf('current') === -1 && !isNaN(num) && num > 0) limitCandidates.push(num);
                 }
 
-                // Recurse into nested objects
-                if (v && typeof v === 'object' && !Array.isArray(v)) {
-                    collectFromObj(v);
-                }
-                // Recurse into arrays
-                if (Array.isArray(v)) {
-                    for (var j = 0; j < v.length; j++) {
-                        if (v[j] && typeof v[j] === 'object') collectFromObj(v[j]);
-                    }
-                }
+                if (val && typeof val === 'object') hunt(val, depth + 1);
             }
         };
 
-        collectFromObj(result);
+        hunt(result, 0);
 
-        // Pick the best values
-        if (usedCandidates.length > 0) {
-            used = Math.max.apply(null, usedCandidates.filter(function(n) { return !isNaN(n); }));
-        }
-        if (limitCandidates.length > 0) {
-            limit = Math.max.apply(null, limitCandidates.filter(function(n) { return !isNaN(n) && n > 0; }));
-        }
+        var used = usedCandidates.length > 0 ? Math.max.apply(null, usedCandidates) : 0;
+        var limit = limitCandidates.length > 0 ? Math.max.apply(null, limitCandidates) : 0;
 
-        // If we found used but no limit, default to free tier limit
-        if (used > 0 && limit === 0) {
-            limit = FREE_TIER_DEFAULT_LIMIT;
-            logger.info('[Pool] No limit field found, defaulting to ' + FREE_TIER_DEFAULT_LIMIT);
-        }
-
+        if (used > 0 && limit === 0) limit = FREE_TIER_DEFAULT_LIMIT;
         if (isNaN(used)) used = 0;
         if (isNaN(limit)) limit = FREE_TIER_DEFAULT_LIMIT;
 
-        logger.info('[Pool] Extracted credits: ' + used + '/' + limit);
+        logger.info('[Pool] Credits: ' + used + '/' + limit + ' (candidates: used=' + JSON.stringify(usedCandidates) + ' limit=' + JSON.stringify(limitCandidates) + ')');
         return { used: used, limit: limit };
     }
 
-    disableAccount(id) {
-        var account = this._findById(id);
-        if (!account) return { success: false, error: 'Not found' };
-        account.status = STATUS.DISABLED;
-        return { success: true };
-    }
-
-    enableAccount(id) {
-        var account = this._findById(id);
-        if (!account) return { success: false, error: 'Not found' };
-        account.status = STATUS.HEALTHY; account.lastError = null;
-        return { success: true };
-    }
+    disableAccount(id) { var a = this._findById(id); if (!a) return { success: false, error: 'Not found' }; a.status = STATUS.DISABLED; return { success: true }; }
+    enableAccount(id) { var a = this._findById(id); if (!a) return { success: false, error: 'Not found' }; a.status = STATUS.HEALTHY; a.lastError = null; return { success: true }; }
 
     removeAccount(id) {
         var idx = -1;
         for (var i = 0; i < this.accounts.length; i++) { if (this.accounts[i].id === id) { idx = i; break; } }
         if (idx === -1) return { success: false, error: 'Not found' };
-        var account = this.accounts[idx];
-        if (account.refreshTimer) clearInterval(account.refreshTimer);
+        if (this.accounts[idx].refreshTimer) clearInterval(this.accounts[idx].refreshTimer);
         this.accounts.splice(idx, 1);
         return { success: true, removed: id };
     }
@@ -225,15 +200,27 @@ class AccountPool {
     async healthCheck(id) {
         var account = this._findById(id);
         if (!account) return { success: false, error: 'Not found' };
+        return await this._checkSingleAccountCredits(account);
+    }
+
+    async _checkSingleAccountCredits(account) {
         try {
+            // Ensure token is fresh before checking
+            if (account.service.isTokenExpired()) {
+                logger.info('[Pool] Token expired for ' + account.id + ', refreshing before credit check');
+                await account.service.initializeAuth(true);
+            }
             var result = await account.service.getUsageLimits();
-            account.status = STATUS.HEALTHY; account.lastError = null;
+            account.status = STATUS.HEALTHY;
+            account.lastError = null;
             var extracted = this._extractCredits(result);
             account.lastUsage = { usedCount: extracted.used, limitCount: extracted.limit, checkedAt: new Date().toISOString() };
-            return { success: true, healthy: true, usedCount: extracted.used, limitCount: extracted.limit };
+            return { success: true, healthy: true, id: account.id, usedCount: extracted.used, limitCount: extracted.limit };
         } catch (error) {
-            account.status = STATUS.UNHEALTHY; account.lastError = error.message;
-            return { success: true, healthy: false, error: error.message };
+            logger.warn('[Pool] Credit check failed for ' + account.id + ': ' + error.message);
+            // Don't mark as unhealthy just because credit check failed — might be temporary
+            account.lastUsage = { usedCount: 0, limitCount: FREE_TIER_DEFAULT_LIMIT, checkedAt: new Date().toISOString(), error: error.message };
+            return { success: true, healthy: false, id: account.id, error: error.message };
         }
     }
 
@@ -241,19 +228,24 @@ class AccountPool {
         var results = [];
         for (var i = 0; i < this.accounts.length; i++) {
             var account = this.accounts[i];
-            if (account.status === STATUS.DISABLED) { results.push({ id: account.id, skipped: true, reason: 'disabled' }); continue; }
-            try {
-                var result = await account.service.getUsageLimits();
-                var extracted = this._extractCredits(result);
-                account.lastUsage = { usedCount: extracted.used, limitCount: extracted.limit, checkedAt: new Date().toISOString() };
-                account.status = STATUS.HEALTHY; account.lastError = null;
-                results.push({ id: account.id, healthy: true, usedCount: extracted.used, limitCount: extracted.limit });
-            } catch (error) {
-                account.status = STATUS.UNHEALTHY; account.lastError = error.message;
-                results.push({ id: account.id, healthy: false, error: error.message });
+            if (account.status === STATUS.DISABLED) {
+                results.push({ id: account.id, skipped: true, reason: 'disabled' });
+                continue;
             }
+            var result = await this._checkSingleAccountCredits(account);
+            results.push(result);
         }
         return results;
+    }
+
+    _startCreditCheckTimer() {
+        if (this._creditCheckTimer) return;
+        var self = this;
+        this._creditCheckTimer = setInterval(function() {
+            self.checkAllCredits().catch(function(e) { logger.warn('[Pool] Periodic credit check failed: ' + e.message); });
+        }, CREDIT_CHECK_INTERVAL_MS);
+        if (this._creditCheckTimer.unref) this._creditCheckTimer.unref();
+        logger.info('[Pool] Auto credit check started (every ' + Math.round(CREDIT_CHECK_INTERVAL_MS / 60000) + 'min)');
     }
 
     _findById(id) { for (var i = 0; i < this.accounts.length; i++) { if (this.accounts[i].id === id) return this.accounts[i]; } return null; }
@@ -291,7 +283,7 @@ class AccountPool {
     async _backgroundRefresh(account) {
         if (account.status === STATUS.REFRESHING) return;
         account.status = STATUS.REFRESHING;
-        try { await account.service.loadCredentials(); await account.service.initializeAuth(true); account.status = STATUS.HEALTHY; account.lastError = null; }
+        try { await account.service.loadCredentials(); await account.service.initializeAuth(true); account.status = STATUS.HEALTHY; account.lastError = null; logger.info('[Pool] Refreshed ' + account.id); }
         catch (error) { account.status = STATUS.UNHEALTHY; account.lastError = 'Refresh failed: ' + error.message; }
     }
 
@@ -315,7 +307,17 @@ class AccountPool {
     getStatuses() {
         var baseDir = process.env.DATA_DIR || process.cwd();
         return this.accounts.map(function(a) {
-            return { id: a.id, label: a.label, status: a.status, activeRequests: a.activeRequests, totalRequests: a.totalRequests, totalErrors: a.totalErrors, lastError: a.lastError, lastUsedAt: a.lastUsedAt, createdAt: a.createdAt, credPath: a.credPath ? path.relative(baseDir, a.credPath) : null, authMethod: (a.service && a.service.authMethod) || 'unknown', region: (a.service && a.service.region) || 'unknown', expiresAt: (a.service && a.service.expiresAt) || null, lastUsage: a.lastUsage || null };
+            return {
+                id: a.id, label: a.label, status: a.status,
+                activeRequests: a.activeRequests, totalRequests: a.totalRequests,
+                totalErrors: a.totalErrors, lastError: a.lastError,
+                lastUsedAt: a.lastUsedAt, createdAt: a.createdAt,
+                credPath: a.credPath ? path.relative(baseDir, a.credPath) : null,
+                authMethod: (a.service && a.service.authMethod) || 'unknown',
+                region: (a.service && a.service.region) || 'unknown',
+                expiresAt: (a.service && a.service.expiresAt) || null,
+                lastUsage: a.lastUsage || null,
+            };
         });
     }
 
