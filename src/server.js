@@ -4,30 +4,26 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import logger from './utils/logger.js';
 import { getAccountPool } from './pool/account-pool.js';
-import { KIRO_FREE_MODELS, KIRO_PAID_MODELS, KIRO_ALL_MODELS, KiroApiService } from './providers/claude-kiro.js';
+import { KIRO_FREE_MODELS_FULL, KIRO_PAID_MODELS_FULL, KIRO_ALL_MODELS, KiroApiService } from './providers/claude-kiro.js';
 import { KiroApiError } from './providers/kiro-error.js';
 import { toClaudeRequestFromOpenAI, toOpenAIChatCompletionFromClaude, ClaudeToOpenAIStreamAdapter } from './convert/convert.js';
 import { handleKiroOAuth, batchImportRefreshTokens, importAwsCredentials } from './auth/kiro-oauth.js';
 import { recordRequest, recordError, getStats, loadStats, saveStats } from './tracking/stats.js';
 import { buildMainPage, buildModelsPage } from './pages.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express();
+var __dirname = path.dirname(fileURLToPath(import.meta.url));
+var app = express();
 app.use(express.json({ limit: '50mb' }));
 
-const PORT = parseInt(process.env.PORT, 10) || 7860;
-const HOST = process.env.HOST || '0.0.0.0';
-const API_KEY = process.env.API_KEY || 'here-you-go-ai';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-me-please';
-
-// =============================================================================
-// Middleware
-// =============================================================================
+var PORT = parseInt(process.env.PORT, 10) || 7860;
+var HOST = process.env.HOST || '0.0.0.0';
+var runtimeApiKey = process.env.API_KEY || 'here-you-go-ai';
+var ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-me-please';
 
 function requireApiKey(req, res, next) {
     var auth = req.headers.authorization;
     var key = auth && auth.startsWith('Bearer ') ? auth.slice(7) : req.query.key;
-    if (key === API_KEY) return next();
+    if (key === runtimeApiKey) return next();
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
 }
 
@@ -43,23 +39,15 @@ function identifyUser(req) {
     return (fwd ? fwd.split(',')[0].trim() : null) || req.socket.remoteAddress || 'unknown';
 }
 
-// =============================================================================
-// HTML pages
-// =============================================================================
-
 app.get('/', function(req, res) {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(buildMainPage(KIRO_FREE_MODELS, KIRO_PAID_MODELS));
+    res.send(buildMainPage(KIRO_FREE_MODELS_FULL, KIRO_PAID_MODELS_FULL));
 });
 
 app.get('/ui/models', function(req, res) {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(buildModelsPage(KIRO_FREE_MODELS, KIRO_PAID_MODELS));
+    res.send(buildModelsPage(KIRO_FREE_MODELS_FULL, KIRO_PAID_MODELS_FULL));
 });
-
-// =============================================================================
-// JSON API — Models (public)
-// =============================================================================
 
 app.get('/v1/models', function(req, res) {
     var models = KIRO_ALL_MODELS.map(function(id) {
@@ -68,15 +56,10 @@ app.get('/v1/models', function(req, res) {
     res.json({ object: 'list', data: models });
 });
 
-// =============================================================================
-// OpenAI-compatible chat (API key protected)
-// =============================================================================
-
 app.post('/v1/chat/completions', requireApiKey, async function(req, res) {
     var user = identifyUser(req);
     recordRequest(user);
     var streamStarted = false;
-
     try {
         var claudeRequest = toClaudeRequestFromOpenAI(req.body);
         var model = claudeRequest.model || 'claude-sonnet-4-5';
@@ -85,7 +68,6 @@ app.post('/v1/chat/completions', requireApiKey, async function(req, res) {
         var acquired = pool.acquireAccount();
         var account = acquired.account;
         var release = acquired.release;
-
         try {
             if (isStream) {
                 res.setHeader('Content-Type', 'text/event-stream');
@@ -93,7 +75,6 @@ app.post('/v1/chat/completions', requireApiKey, async function(req, res) {
                 res.setHeader('Connection', 'keep-alive');
                 res.setHeader('X-Accel-Buffering', 'no');
                 streamStarted = true;
-
                 var adapter = new ClaudeToOpenAIStreamAdapter(req.body.model || model);
                 for await (var event of account.service.generateContentStream(model, claudeRequest)) {
                     var chunks = adapter.convert(event);
@@ -107,28 +88,21 @@ app.post('/v1/chat/completions', requireApiKey, async function(req, res) {
                 release();
                 res.json(openaiResponse);
             }
-        } catch (error) {
-            release(error);
-            throw error;
-        }
+        } catch (error) { release(error); throw error; }
     } catch (error) {
         recordError();
         if (streamStarted && res.headersSent) {
             res.write('data: {"error":"' + error.message.replace(/"/g, '\\"') + '"}\n\n');
             res.write('data: [DONE]\n\n');
             res.end();
-        } else {
-            handleApiError(res, error);
-        }
+        } else { handleApiError(res, error); }
     }
 });
 
-// Claude native messages (API key protected)
 app.post('/v1/messages', requireApiKey, async function(req, res) {
     var user = identifyUser(req);
     recordRequest(user);
     var streamStarted = false;
-
     try {
         var model = req.body.model || 'claude-sonnet-4-5';
         var isStream = req.body.stream === true;
@@ -136,7 +110,6 @@ app.post('/v1/messages', requireApiKey, async function(req, res) {
         var acquired = pool.acquireAccount();
         var account = acquired.account;
         var release = acquired.release;
-
         try {
             if (isStream) {
                 res.setHeader('Content-Type', 'text/event-stream');
@@ -144,7 +117,6 @@ app.post('/v1/messages', requireApiKey, async function(req, res) {
                 res.setHeader('Connection', 'keep-alive');
                 res.setHeader('X-Accel-Buffering', 'no');
                 streamStarted = true;
-
                 for await (var event of account.service.generateContentStream(model, req.body)) {
                     res.write('event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n');
                 }
@@ -155,18 +127,13 @@ app.post('/v1/messages', requireApiKey, async function(req, res) {
                 release();
                 res.json(response);
             }
-        } catch (error) {
-            release(error);
-            throw error;
-        }
+        } catch (error) { release(error); throw error; }
     } catch (error) {
         recordError();
         if (streamStarted && res.headersSent) {
             res.write('event: error\ndata: ' + JSON.stringify({ type: 'error', error: { message: error.message } }) + '\n\n');
             res.end();
-        } else {
-            handleApiError(res, error);
-        }
+        } else { handleApiError(res, error); }
     }
 });
 
@@ -174,17 +141,9 @@ app.post('/v1/messages/count_tokens', requireApiKey, function(req, res) {
     res.json(KiroApiService.countTokens(req.body));
 });
 
-// =============================================================================
-// Admin API (admin password protected)
-// =============================================================================
-
 app.get('/admin/stats', requireAdmin, function(req, res) {
     var pool = getAccountPool();
     res.json({ stats: getStats(), accounts: pool.getStatuses() });
-});
-
-app.get('/admin/accounts', requireAdmin, function(req, res) {
-    res.json({ accounts: getAccountPool().getStatuses() });
 });
 
 app.get('/admin/credentials/export', requireAdmin, function(req, res) {
@@ -201,11 +160,8 @@ app.post('/admin/credentials/import', requireAdmin, async function(req, res) {
 });
 
 app.post('/admin/credentials/batch-import', requireAdmin, async function(req, res) {
-    try {
-        var tokens = req.body.refreshTokens || [];
-        var region = req.body.region || 'us-east-1';
-        res.json(await batchImportRefreshTokens(tokens, region));
-    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+    try { res.json(await batchImportRefreshTokens(req.body.refreshTokens || [], req.body.region || 'us-east-1')); }
+    catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.post('/auth/kiro/oauth', requireAdmin, async function(req, res) {
@@ -232,18 +188,38 @@ app.post('/admin/rescan', requireAdmin, async function(req, res) {
     res.json({ added: added, total: getAccountPool().getAccountCount() });
 });
 
-// =============================================================================
-// Health check (JSON)
-// =============================================================================
+app.post('/admin/account/:id/disable', requireAdmin, function(req, res) {
+    res.json(getAccountPool().disableAccount(req.params.id));
+});
+
+app.post('/admin/account/:id/enable', requireAdmin, function(req, res) {
+    res.json(getAccountPool().enableAccount(req.params.id));
+});
+
+app.post('/admin/account/:id/remove', requireAdmin, function(req, res) {
+    res.json(getAccountPool().removeAccount(req.params.id));
+});
+
+app.post('/admin/account/:id/health-check', requireAdmin, async function(req, res) {
+    res.json(await getAccountPool().healthCheck(req.params.id));
+});
+
+app.get('/admin/settings/api-key', requireAdmin, function(req, res) {
+    res.json({ apiKey: runtimeApiKey });
+});
+
+app.post('/admin/settings/api-key', requireAdmin, function(req, res) {
+    var newKey = req.body.apiKey;
+    if (!newKey || newKey.length < 4) return res.status(400).json({ error: 'API key must be at least 4 characters' });
+    runtimeApiKey = newKey;
+    logger.info('[Admin] API key changed at runtime');
+    res.json({ success: true, apiKey: runtimeApiKey });
+});
 
 app.get('/api/health', function(req, res) {
     var pool = getAccountPool();
     res.json({ service: 'kiro2-api', status: 'running', accounts: { total: pool.getAccountCount(), healthy: pool.getHealthyCount() }, stats: getStats() });
 });
-
-// =============================================================================
-// Error handler
-// =============================================================================
 
 function handleApiError(res, error) {
     if (res.headersSent) { logger.error('[API] Error after headers: ' + error.message); return; }
@@ -252,10 +228,6 @@ function handleApiError(res, error) {
     logger.error('[API] ' + type + ': ' + error.message);
     res.status(status).json({ error: { message: error.message, type: type, code: status } });
 }
-
-// =============================================================================
-// Start
-// =============================================================================
 
 async function main() {
     logger.info('==================================================');
