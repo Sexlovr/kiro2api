@@ -7,7 +7,7 @@ import { getAccountPool } from './pool/account-pool.js';
 import { KIRO_FREE_MODELS_FULL, KIRO_PAID_MODELS_FULL, KIRO_ALL_MODELS, KiroApiService } from './providers/claude-kiro.js';
 import { KiroApiError } from './providers/kiro-error.js';
 import { toClaudeRequestFromOpenAI, toOpenAIChatCompletionFromClaude, ClaudeToOpenAIStreamAdapter } from './convert/convert.js';
-import { handleKiroOAuth, batchImportRefreshTokens, importAwsCredentials } from './auth/kiro-oauth.js';
+import { handleKiroOAuth, batchImportRefreshTokens, importAwsCredentials, exchangeOAuthCode } from './auth/kiro-oauth.js';
 import { recordRequest, recordError, getStats, loadStats, saveStats } from './tracking/stats.js';
 import { buildMainPage, buildModelsPage } from './pages.js';
 
@@ -167,6 +167,17 @@ app.post('/admin/credentials/batch-import', requireAdmin, async function(req, re
 app.post('/auth/kiro/oauth', requireAdmin, async function(req, res) {
     try { res.json(await handleKiroOAuth(req.body)); }
     catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Exchange pasted redirect URL for Google/GitHub social OAuth
+app.post('/auth/kiro/exchange', requireAdmin, async function(req, res) {
+    try {
+        var redirectUrl = req.body.redirectUrl || req.body.url || '';
+        var result = await exchangeOAuthCode(redirectUrl);
+        res.json(result);
+    } catch (e) {
+        res.status(400).json({ success: false, error: e.message });
+    }
 });
 
 app.post('/admin/refresh-all', requireAdmin, async function(req, res) {
