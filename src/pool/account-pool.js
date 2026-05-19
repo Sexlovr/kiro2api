@@ -139,6 +139,60 @@ class AccountPool {
         };
     }
 
+    _extractCredits(result) {
+        var used = 0;
+        var limit = 0;
+
+        logger.info('[Pool] Raw AWS Usage Payload: ' + JSON.stringify(result));
+
+        var limitsArray = result.usageLimits || result.limits || result.data || null;
+
+        if (Array.isArray(limitsArray) && limitsArray.length > 0) {
+            var target = null;
+            for (var i = 0; i < limitsArray.length; i++) {
+                if (limitsArray[i].resourceType === 'AGENTIC_REQUEST') { target = limitsArray[i]; break; }
+            }
+            if (!target) target = limitsArray[0];
+            if (target) {
+                used = target.usedCount || target.used || target.currentUsage || 0;
+                limit = target.limitCount || target.limit || target.max || target.maxUsage || 0;
+            }
+        } else if (result && typeof result === 'object') {
+            used = result.usedCount || result.used || result.currentUsage || 0;
+            limit = result.limitCount || result.limit || result.max || result.maxUsage || 0;
+
+            if (used === 0 && limit === 0) {
+                var keys = Object.keys(result);
+                for (var k = 0; k < keys.length; k++) {
+                    var val = result[keys[k]];
+                    if (val && typeof val === 'object' && !Array.isArray(val)) {
+                        var innerUsed = val.usedCount || val.used || val.currentUsage || 0;
+                        var innerLimit = val.limitCount || val.limit || val.max || val.maxUsage || 0;
+                        if (innerUsed > 0 || innerLimit > 0) {
+                            used = innerUsed;
+                            limit = innerLimit;
+                            break;
+                        }
+                    }
+                    if (Array.isArray(val) && val.length > 0) {
+                        var first = val[0];
+                        if (first && typeof first === 'object') {
+                            used = first.usedCount || first.used || first.currentUsage || 0;
+                            limit = first.limitCount || first.limit || first.max || first.maxUsage || 0;
+                            if (used > 0 || limit > 0) break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (typeof used === 'string') used = parseFloat(used) || 0;
+        if (typeof limit === 'string') limit = parseFloat(limit) || 0;
+
+        logger.info('[Pool] Extracted credits: ' + used + '/' + limit);
+        return { used: used, limit: limit };
+    }
+
     disableAccount(id) {
         var account = this._findById(id);
         if (!account) return { success: false, error: 'Not found' };
@@ -174,10 +228,9 @@ class AccountPool {
             var result = await account.service.getUsageLimits();
             account.status = STATUS.HEALTHY;
             account.lastError = null;
-            var used = result.usedCount || 0;
-            var limit = result.limitCount || 0;
-            account.lastUsage = { usedCount: used, limitCount: limit, checkedAt: new Date().toISOString() };
-            return { success: true, healthy: true, usedCount: used, limitCount: limit };
+            var extracted = this._extractCredits(result);
+            account.lastUsage = { usedCount: extracted.used, limitCount: extracted.limit, checkedAt: new Date().toISOString() };
+            return { success: true, healthy: true, usedCount: extracted.used, limitCount: extracted.limit };
         } catch (error) {
             account.status = STATUS.UNHEALTHY;
             account.lastError = error.message;
@@ -195,12 +248,11 @@ class AccountPool {
             }
             try {
                 var result = await account.service.getUsageLimits();
-                var used = result.usedCount || 0;
-                var limit = result.limitCount || 0;
-                account.lastUsage = { usedCount: used, limitCount: limit, checkedAt: new Date().toISOString() };
+                var extracted = this._extractCredits(result);
+                account.lastUsage = { usedCount: extracted.used, limitCount: extracted.limit, checkedAt: new Date().toISOString() };
                 account.status = STATUS.HEALTHY;
                 account.lastError = null;
-                results.push({ id: account.id, healthy: true, usedCount: used, limitCount: limit });
+                results.push({ id: account.id, healthy: true, usedCount: extracted.used, limitCount: extracted.limit });
             } catch (error) {
                 account.status = STATUS.UNHEALTHY;
                 account.lastError = error.message;
