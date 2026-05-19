@@ -5,25 +5,17 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 
-var STATUS = {
-    HEALTHY: 'healthy',
-    REFRESHING: 'refreshing',
-    UNHEALTHY: 'unhealthy',
-    COOLDOWN: 'cooldown',
-    DISABLED: 'disabled',
-};
-
+var STATUS = { HEALTHY: 'healthy', REFRESHING: 'refreshing', UNHEALTHY: 'unhealthy', COOLDOWN: 'cooldown', DISABLED: 'disabled' };
 var COOLDOWN_MS = { RATE_LIMIT: 30000, SERVER: 10000 };
 
 class AccountPool {
     constructor(config) {
         config = config || {};
+        var baseDir = process.env.DATA_DIR || process.cwd();
         this.accounts = [];
         this.roundRobinIndex = 0;
-        this.refreshIntervalMs = config.tokenRefreshIntervalMs
-            || parseInt(process.env.KIRO_TOKEN_REFRESH_INTERVAL_MS, 10)
-            || 45 * 60 * 1000;
-        this.configsDir = config.configsDir || path.join(process.cwd(), 'configs', 'kiro');
+        this.refreshIntervalMs = config.tokenRefreshIntervalMs || parseInt(process.env.KIRO_TOKEN_REFRESH_INTERVAL_MS, 10) || 45 * 60 * 1000;
+        this.configsDir = config.configsDir || path.join(baseDir, 'configs', 'kiro');
         this._keepAliveRunning = false;
     }
 
@@ -33,13 +25,11 @@ class AccountPool {
         await this._loadFromDirectory();
         var total = this.accounts.length;
         var healthy = this.accounts.filter(function(a) { return a.status === STATUS.HEALTHY; }).length;
-        logger.info('[Pool] Initialized: ' + total + ' account(s), ' + healthy + ' healthy');
+        logger.info('[Pool] Initialized: ' + total + ' account(s), ' + healthy + ' healthy. Dir: ' + this.configsDir);
         if (total > 0) this.startKeepAlive();
     }
 
-    async _ensureConfigsDir() {
-        try { await fs.mkdir(this.configsDir, { recursive: true }); } catch (e) {}
-    }
+    async _ensureConfigsDir() { try { await fs.mkdir(this.configsDir, { recursive: true }); } catch (e) {} }
 
     async _loadFromEnv() {
         var single = process.env.KIRO_OAUTH_CREDS_BASE64;
@@ -47,9 +37,7 @@ class AccountPool {
         var multi = process.env.KIRO_ACCOUNTS_BASE64;
         if (multi) {
             var parts = multi.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
-            for (var i = 0; i < parts.length; i++) {
-                await this.addAccountFromBase64(parts[i], 'env:KIRO_ACCOUNTS_BASE64[' + i + ']');
-            }
+            for (var i = 0; i < parts.length; i++) await this.addAccountFromBase64(parts[i], 'env:KIRO_ACCOUNTS_BASE64[' + i + ']');
         }
     }
 
@@ -67,9 +55,7 @@ class AccountPool {
                 } else if (entry.isFile() && entry.name.endsWith('.json')) {
                     await this.addAccountFromFile(path.join(this.configsDir, entry.name));
                 }
-            } catch (e) {
-                logger.warn('[Pool] Error loading ' + entries[i].name + ': ' + e.message);
-            }
+            } catch (e) { logger.warn('[Pool] Error loading ' + entries[i].name + ': ' + e.message); }
         }
     }
 
@@ -89,10 +75,7 @@ class AccountPool {
                 } else if (entries[i].isFile() && entries[i].name.endsWith('.json')) {
                     credPath = path.join(this.configsDir, entries[i].name);
                 }
-                if (credPath && !existingPaths.has(credPath)) {
-                    await this.addAccountFromFile(credPath);
-                    added++;
-                }
+                if (credPath && !existingPaths.has(credPath)) { await this.addAccountFromFile(credPath); added++; }
             } catch (e) {}
         }
         if (added > 0) logger.info('[Pool] Scan found ' + added + ' new account(s)');
@@ -106,35 +89,26 @@ class AccountPool {
             await service.initialize();
             var account = this._createAccountEntry(service, credPath, path.basename(credPath));
             this.accounts.push(account);
-            logger.info('[Pool] Added account ' + account.id + ' from ' + path.relative(process.cwd(), credPath));
+            var baseDir = process.env.DATA_DIR || process.cwd();
+            logger.info('[Pool] Added account ' + account.id + ' from ' + path.relative(baseDir, credPath));
             if (this._keepAliveRunning) this._startAccountRefreshTimer(account);
             return account.id;
-        } catch (error) {
-            logger.error('[Pool] Failed to add from ' + credPath + ': ' + error.message);
-            return null;
-        }
+        } catch (error) { logger.error('[Pool] Failed to add from ' + credPath + ': ' + error.message); return null; }
     }
 
     async addAccountFromBase64(base64String, sourceLabel) {
         try {
             var decoded = Buffer.from(base64String, 'base64').toString('utf8');
-            var credentials = JSON.parse(decoded);
-            var credPath = await this._saveCredsToDisk(credentials);
+            var credPath = await this._saveCredsToDisk(JSON.parse(decoded));
             return await this.addAccountFromFile(credPath);
-        } catch (error) {
-            logger.error('[Pool] Failed from ' + (sourceLabel || 'base64') + ': ' + error.message);
-            return null;
-        }
+        } catch (error) { logger.error('[Pool] Failed from ' + (sourceLabel || 'base64') + ': ' + error.message); return null; }
     }
 
     async addAccountFromCredentials(credentials) {
         try {
             var credPath = await this._saveCredsToDisk(credentials);
             return await this.addAccountFromFile(credPath);
-        } catch (error) {
-            logger.error('[Pool] Failed from credentials: ' + error.message);
-            return null;
-        }
+        } catch (error) { logger.error('[Pool] Failed from credentials: ' + error.message); return null; }
     }
 
     async _saveCredsToDisk(credentials) {
@@ -161,47 +135,49 @@ class AccountPool {
             refreshTimer: null,
             totalRequests: 0,
             totalErrors: 0,
+            lastUsage: null,
         };
     }
 
     disableAccount(id) {
         var account = this._findById(id);
-        if (!account) return { success: false, error: 'Account not found' };
+        if (!account) return { success: false, error: 'Not found' };
         account.status = STATUS.DISABLED;
-        logger.info('[Pool] Disabled account ' + id);
+        logger.info('[Pool] Disabled ' + id);
         return { success: true };
     }
 
     enableAccount(id) {
         var account = this._findById(id);
-        if (!account) return { success: false, error: 'Account not found' };
+        if (!account) return { success: false, error: 'Not found' };
         account.status = STATUS.HEALTHY;
         account.lastError = null;
-        logger.info('[Pool] Enabled account ' + id);
+        logger.info('[Pool] Enabled ' + id);
         return { success: true };
     }
 
     removeAccount(id) {
         var idx = -1;
-        for (var i = 0; i < this.accounts.length; i++) {
-            if (this.accounts[i].id === id) { idx = i; break; }
-        }
-        if (idx === -1) return { success: false, error: 'Account not found' };
+        for (var i = 0; i < this.accounts.length; i++) { if (this.accounts[i].id === id) { idx = i; break; } }
+        if (idx === -1) return { success: false, error: 'Not found' };
         var account = this.accounts[idx];
         if (account.refreshTimer) clearInterval(account.refreshTimer);
         this.accounts.splice(idx, 1);
-        logger.info('[Pool] Removed account ' + id);
+        logger.info('[Pool] Removed ' + id);
         return { success: true, removed: id };
     }
 
     async healthCheck(id) {
         var account = this._findById(id);
-        if (!account) return { success: false, error: 'Account not found' };
+        if (!account) return { success: false, error: 'Not found' };
         try {
             var result = await account.service.getUsageLimits();
             account.status = STATUS.HEALTHY;
             account.lastError = null;
-            return { success: true, healthy: true, usedCount: result.usedCount || 0, limitCount: result.limitCount || 0 };
+            var used = result.usedCount || 0;
+            var limit = result.limitCount || 0;
+            account.lastUsage = { usedCount: used, limitCount: limit, checkedAt: new Date().toISOString() };
+            return { success: true, healthy: true, usedCount: used, limitCount: limit };
         } catch (error) {
             account.status = STATUS.UNHEALTHY;
             account.lastError = error.message;
@@ -209,45 +185,60 @@ class AccountPool {
         }
     }
 
-    _findById(id) {
+    async checkAllCredits() {
+        var results = [];
         for (var i = 0; i < this.accounts.length; i++) {
-            if (this.accounts[i].id === id) return this.accounts[i];
+            var account = this.accounts[i];
+            if (account.status === STATUS.DISABLED) {
+                results.push({ id: account.id, skipped: true, reason: 'disabled' });
+                continue;
+            }
+            try {
+                var result = await account.service.getUsageLimits();
+                var used = result.usedCount || 0;
+                var limit = result.limitCount || 0;
+                account.lastUsage = { usedCount: used, limitCount: limit, checkedAt: new Date().toISOString() };
+                account.status = STATUS.HEALTHY;
+                account.lastError = null;
+                results.push({ id: account.id, healthy: true, usedCount: used, limitCount: limit });
+            } catch (error) {
+                account.status = STATUS.UNHEALTHY;
+                account.lastError = error.message;
+                results.push({ id: account.id, healthy: false, error: error.message });
+            }
         }
+        return results;
+    }
+
+    _findById(id) {
+        for (var i = 0; i < this.accounts.length; i++) { if (this.accounts[i].id === id) return this.accounts[i]; }
         return null;
     }
 
     acquireAccount() {
         var account = this._selectBestAccount();
-        if (!account) {
-            var total = this.accounts.length;
-            var statuses = this.accounts.map(function(a) { return a.id + ':' + a.status; }).join(', ');
-            throw new Error(
-                total === 0
-                    ? 'No Kiro accounts configured. Add credentials via the admin panel or env vars.'
-                    : 'No healthy accounts available (' + total + ' total: ' + statuses + ')'
-            );
-        }
+        if (!account) throw new Error(this.accounts.length === 0 ? 'No accounts configured.' : 'No healthy accounts available.');
         account.activeRequests++;
         account.lastUsedAt = new Date().toISOString();
         account.totalRequests++;
         var released = false;
         var self = this;
-        var release = function(error) {
-            if (released) return;
-            released = true;
-            account.activeRequests = Math.max(0, account.activeRequests - 1);
-            if (error) self._handleAccountError(account, error);
+        return {
+            account: account,
+            release: function(error) {
+                if (released) return;
+                released = true;
+                account.activeRequests = Math.max(0, account.activeRequests - 1);
+                if (error) self._handleAccountError(account, error);
+            }
         };
-        return { account: account, release: release };
     }
 
     _selectBestAccount() {
         var healthy = this.accounts.filter(function(a) { return a.status === STATUS.HEALTHY; });
         if (healthy.length === 0) return null;
         var minActive = Infinity;
-        for (var i = 0; i < healthy.length; i++) {
-            if (healthy[i].activeRequests < minActive) minActive = healthy[i].activeRequests;
-        }
+        for (var i = 0; i < healthy.length; i++) { if (healthy[i].activeRequests < minActive) minActive = healthy[i].activeRequests; }
         var candidates = healthy.filter(function(a) { return a.activeRequests === minActive; });
         var idx = this.roundRobinIndex % candidates.length;
         this.roundRobinIndex = (this.roundRobinIndex + 1) % 1000000;
@@ -258,83 +249,52 @@ class AccountPool {
         account.totalErrors++;
         var type = (error instanceof KiroApiError) ? error.errorType : 'unknown';
         var self = this;
-        if (type === 'auth') {
-            account.lastError = error.message;
-            self._backgroundRefresh(account);
-        } else if (type === 'rate_limit') {
-            account.status = STATUS.COOLDOWN;
-            account.lastError = error.message;
-            setTimeout(function() { if (account.status === STATUS.COOLDOWN) account.status = STATUS.HEALTHY; }, COOLDOWN_MS.RATE_LIMIT);
-        } else if (type === 'quota') {
-            account.status = STATUS.UNHEALTHY;
-            account.lastError = 'Quota exhausted';
-        } else if (type === 'server') {
-            account.status = STATUS.COOLDOWN;
-            account.lastError = error.message;
-            setTimeout(function() { if (account.status === STATUS.COOLDOWN) account.status = STATUS.HEALTHY; }, COOLDOWN_MS.SERVER);
-        } else if (type !== 'network') {
-            account.lastError = error.message;
-        }
+        if (type === 'auth') { account.lastError = error.message; self._backgroundRefresh(account); }
+        else if (type === 'rate_limit') { account.status = STATUS.COOLDOWN; account.lastError = error.message; setTimeout(function() { if (account.status === STATUS.COOLDOWN) account.status = STATUS.HEALTHY; }, COOLDOWN_MS.RATE_LIMIT); }
+        else if (type === 'quota') { account.status = STATUS.UNHEALTHY; account.lastError = 'Quota exhausted'; }
+        else if (type === 'server') { account.status = STATUS.COOLDOWN; account.lastError = error.message; setTimeout(function() { if (account.status === STATUS.COOLDOWN) account.status = STATUS.HEALTHY; }, COOLDOWN_MS.SERVER); }
+        else if (type !== 'network') { account.lastError = error.message; }
     }
 
     async _backgroundRefresh(account) {
         if (account.status === STATUS.REFRESHING) return;
         account.status = STATUS.REFRESHING;
-        try {
-            await account.service.loadCredentials();
-            await account.service.initializeAuth(true);
-            account.status = STATUS.HEALTHY;
-            account.lastError = null;
-            logger.info('[Pool] Account ' + account.id + ' refreshed');
-        } catch (error) {
-            account.status = STATUS.UNHEALTHY;
-            account.lastError = 'Refresh failed: ' + error.message;
-            logger.error('[Pool] Account ' + account.id + ' refresh failed: ' + error.message);
-        }
+        try { await account.service.loadCredentials(); await account.service.initializeAuth(true); account.status = STATUS.HEALTHY; account.lastError = null; logger.info('[Pool] Account ' + account.id + ' refreshed'); }
+        catch (error) { account.status = STATUS.UNHEALTHY; account.lastError = 'Refresh failed: ' + error.message; logger.error('[Pool] Refresh failed: ' + error.message); }
     }
 
     startKeepAlive() {
         if (this._keepAliveRunning) return;
         this._keepAliveRunning = true;
-        for (var i = 0; i < this.accounts.length; i++) {
-            this._startAccountRefreshTimer(this.accounts[i]);
-        }
-        logger.info('[Pool] Keep-alive started (' + Math.round(this.refreshIntervalMs / 60000) + 'min interval)');
+        for (var i = 0; i < this.accounts.length; i++) this._startAccountRefreshTimer(this.accounts[i]);
+        logger.info('[Pool] Keep-alive started');
     }
 
     _startAccountRefreshTimer(account) {
         var self = this;
         if (account.refreshTimer) clearInterval(account.refreshTimer);
-        account.refreshTimer = setInterval(async function() {
-            if (account.status === STATUS.HEALTHY || account.status === STATUS.UNHEALTHY) {
-                logger.info('[Pool] Keep-alive refresh: ' + account.id);
-                await self._backgroundRefresh(account);
-            }
-        }, this.refreshIntervalMs);
+        account.refreshTimer = setInterval(async function() { if (account.status === STATUS.HEALTHY || account.status === STATUS.UNHEALTHY) { await self._backgroundRefresh(account); } }, this.refreshIntervalMs);
         if (account.refreshTimer.unref) account.refreshTimer.unref();
     }
 
     stopKeepAlive() {
-        for (var i = 0; i < this.accounts.length; i++) {
-            if (this.accounts[i].refreshTimer) {
-                clearInterval(this.accounts[i].refreshTimer);
-                this.accounts[i].refreshTimer = null;
-            }
-        }
+        for (var i = 0; i < this.accounts.length; i++) { if (this.accounts[i].refreshTimer) { clearInterval(this.accounts[i].refreshTimer); this.accounts[i].refreshTimer = null; } }
         this._keepAliveRunning = false;
     }
 
     getStatuses() {
+        var baseDir = process.env.DATA_DIR || process.cwd();
         return this.accounts.map(function(a) {
             return {
                 id: a.id, label: a.label, status: a.status,
                 activeRequests: a.activeRequests, totalRequests: a.totalRequests,
                 totalErrors: a.totalErrors, lastError: a.lastError,
                 lastUsedAt: a.lastUsedAt, createdAt: a.createdAt,
-                credPath: a.credPath ? path.relative(process.cwd(), a.credPath) : null,
+                credPath: a.credPath ? path.relative(baseDir, a.credPath) : null,
                 authMethod: (a.service && a.service.authMethod) || 'unknown',
                 region: (a.service && a.service.region) || 'unknown',
                 expiresAt: (a.service && a.service.expiresAt) || null,
+                lastUsage: a.lastUsage || null,
             };
         });
     }
@@ -344,30 +304,20 @@ class AccountPool {
             return {
                 id: a.id, label: a.label,
                 credentials: {
-                    accessToken: a.service.accessToken,
-                    refreshToken: a.service.refreshToken,
-                    clientId: a.service.clientId || undefined,
-                    clientSecret: a.service.clientSecret || undefined,
-                    profileArn: a.service.profileArn || undefined,
-                    authMethod: a.service.authMethod,
-                    region: a.service.region,
-                    idcRegion: a.service.idcRegion || undefined,
+                    accessToken: a.service.accessToken, refreshToken: a.service.refreshToken,
+                    clientId: a.service.clientId || undefined, clientSecret: a.service.clientSecret || undefined,
+                    profileArn: a.service.profileArn || undefined, authMethod: a.service.authMethod,
+                    region: a.service.region, idcRegion: a.service.idcRegion || undefined,
                     expiresAt: a.service.expiresAt,
                 },
             };
         });
     }
 
-    exportAllCredentialsBase64() {
-        return Buffer.from(JSON.stringify(this.exportAllCredentials(), null, 2)).toString('base64');
-    }
-
+    exportAllCredentialsBase64() { return Buffer.from(JSON.stringify(this.exportAllCredentials(), null, 2)).toString('base64'); }
     getAccountCount() { return this.accounts.length; }
     getHealthyCount() { return this.accounts.filter(function(a) { return a.status === STATUS.HEALTHY; }).length; }
 }
 
 var _pool = null;
-export function getAccountPool(config) {
-    if (!_pool) _pool = new AccountPool(config || {});
-    return _pool;
-}
+export function getAccountPool(config) { if (!_pool) _pool = new AccountPool(config || {}); return _pool; }
