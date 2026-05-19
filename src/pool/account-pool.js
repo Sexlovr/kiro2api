@@ -7,6 +7,7 @@ import crypto from 'crypto';
 
 var STATUS = { HEALTHY: 'healthy', REFRESHING: 'refreshing', UNHEALTHY: 'unhealthy', COOLDOWN: 'cooldown', DISABLED: 'disabled' };
 var COOLDOWN_MS = { RATE_LIMIT: 30000, SERVER: 10000 };
+var FREE_TIER_DEFAULT_LIMIT = 50;
 
 class AccountPool {
     constructor(config) {
@@ -124,18 +125,10 @@ class AccountPool {
     _createAccountEntry(service, credPath, label) {
         return {
             id: crypto.randomBytes(4).toString('hex'),
-            label: label || 'unknown',
-            service: service,
-            credPath: credPath,
-            status: STATUS.HEALTHY,
-            activeRequests: 0,
-            lastError: null,
-            lastUsedAt: null,
-            createdAt: new Date().toISOString(),
-            refreshTimer: null,
-            totalRequests: 0,
-            totalErrors: 0,
-            lastUsage: null,
+            label: label || 'unknown', service: service, credPath: credPath,
+            status: STATUS.HEALTHY, activeRequests: 0, lastError: null,
+            lastUsedAt: null, createdAt: new Date().toISOString(),
+            refreshTimer: null, totalRequests: 0, totalErrors: 0, lastUsage: null,
         };
     }
 
@@ -145,49 +138,61 @@ class AccountPool {
 
         logger.info('[Pool] Raw AWS Usage Payload: ' + JSON.stringify(result));
 
-        var limitsArray = result.usageLimits || result.limits || result.data || null;
+        if (!result || typeof result !== 'object') {
+            return { used: 0, limit: FREE_TIER_DEFAULT_LIMIT };
+        }
 
-        if (Array.isArray(limitsArray) && limitsArray.length > 0) {
-            var target = null;
-            for (var i = 0; i < limitsArray.length; i++) {
-                if (limitsArray[i].resourceType === 'AGENTIC_REQUEST') { target = limitsArray[i]; break; }
-            }
-            if (!target) target = limitsArray[0];
-            if (target) {
-                used = target.usedCount || target.used || target.currentUsage || 0;
-                limit = target.limitCount || target.limit || target.max || target.maxUsage || 0;
-            }
-        } else if (result && typeof result === 'object') {
-            used = result.usedCount || result.used || result.currentUsage || 0;
-            limit = result.limitCount || result.limit || result.max || result.maxUsage || 0;
+        // Collect all candidate number fields from every level
+        var usedCandidates = [];
+        var limitCandidates = [];
 
-            if (used === 0 && limit === 0) {
-                var keys = Object.keys(result);
-                for (var k = 0; k < keys.length; k++) {
-                    var val = result[keys[k]];
-                    if (val && typeof val === 'object' && !Array.isArray(val)) {
-                        var innerUsed = val.usedCount || val.used || val.currentUsage || 0;
-                        var innerLimit = val.limitCount || val.limit || val.max || val.maxUsage || 0;
-                        if (innerUsed > 0 || innerLimit > 0) {
-                            used = innerUsed;
-                            limit = innerLimit;
-                            break;
-                        }
-                    }
-                    if (Array.isArray(val) && val.length > 0) {
-                        var first = val[0];
-                        if (first && typeof first === 'object') {
-                            used = first.usedCount || first.used || first.currentUsage || 0;
-                            limit = first.limitCount || first.limit || first.max || first.maxUsage || 0;
-                            if (used > 0 || limit > 0) break;
-                        }
+        var collectFromObj = function(obj) {
+            if (!obj || typeof obj !== 'object') return;
+            var keys = Object.keys(obj);
+            for (var i = 0; i < keys.length; i++) {
+                var k = keys[i].toLowerCase();
+                var v = obj[keys[i]];
+
+                // Used count fields
+                if (k === 'usedcount' || k === 'used' || k === 'currentusage' || k === 'usagecount' || k === 'consumed' || k === 'requestcount') {
+                    if (typeof v === 'number' || typeof v === 'string') usedCandidates.push(Number(v));
+                }
+                // Limit count fields
+                if (k === 'limitcount' || k === 'limit' || k === 'max' || k === 'maxusage' || k === 'maxcount' || k === 'allowedcount' || k === 'totalcount' || k === 'quota' || k === 'maxrequests' || k === 'totallimit') {
+                    if (typeof v === 'number' || typeof v === 'string') limitCandidates.push(Number(v));
+                }
+
+                // Recurse into nested objects
+                if (v && typeof v === 'object' && !Array.isArray(v)) {
+                    collectFromObj(v);
+                }
+                // Recurse into arrays
+                if (Array.isArray(v)) {
+                    for (var j = 0; j < v.length; j++) {
+                        if (v[j] && typeof v[j] === 'object') collectFromObj(v[j]);
                     }
                 }
             }
+        };
+
+        collectFromObj(result);
+
+        // Pick the best values
+        if (usedCandidates.length > 0) {
+            used = Math.max.apply(null, usedCandidates.filter(function(n) { return !isNaN(n); }));
+        }
+        if (limitCandidates.length > 0) {
+            limit = Math.max.apply(null, limitCandidates.filter(function(n) { return !isNaN(n) && n > 0; }));
         }
 
-        if (typeof used === 'string') used = parseFloat(used) || 0;
-        if (typeof limit === 'string') limit = parseFloat(limit) || 0;
+        // If we found used but no limit, default to free tier limit
+        if (used > 0 && limit === 0) {
+            limit = FREE_TIER_DEFAULT_LIMIT;
+            logger.info('[Pool] No limit field found, defaulting to ' + FREE_TIER_DEFAULT_LIMIT);
+        }
+
+        if (isNaN(used)) used = 0;
+        if (isNaN(limit)) limit = FREE_TIER_DEFAULT_LIMIT;
 
         logger.info('[Pool] Extracted credits: ' + used + '/' + limit);
         return { used: used, limit: limit };
@@ -197,16 +202,13 @@ class AccountPool {
         var account = this._findById(id);
         if (!account) return { success: false, error: 'Not found' };
         account.status = STATUS.DISABLED;
-        logger.info('[Pool] Disabled ' + id);
         return { success: true };
     }
 
     enableAccount(id) {
         var account = this._findById(id);
         if (!account) return { success: false, error: 'Not found' };
-        account.status = STATUS.HEALTHY;
-        account.lastError = null;
-        logger.info('[Pool] Enabled ' + id);
+        account.status = STATUS.HEALTHY; account.lastError = null;
         return { success: true };
     }
 
@@ -217,7 +219,6 @@ class AccountPool {
         var account = this.accounts[idx];
         if (account.refreshTimer) clearInterval(account.refreshTimer);
         this.accounts.splice(idx, 1);
-        logger.info('[Pool] Removed ' + id);
         return { success: true, removed: id };
     }
 
@@ -226,14 +227,12 @@ class AccountPool {
         if (!account) return { success: false, error: 'Not found' };
         try {
             var result = await account.service.getUsageLimits();
-            account.status = STATUS.HEALTHY;
-            account.lastError = null;
+            account.status = STATUS.HEALTHY; account.lastError = null;
             var extracted = this._extractCredits(result);
             account.lastUsage = { usedCount: extracted.used, limitCount: extracted.limit, checkedAt: new Date().toISOString() };
             return { success: true, healthy: true, usedCount: extracted.used, limitCount: extracted.limit };
         } catch (error) {
-            account.status = STATUS.UNHEALTHY;
-            account.lastError = error.message;
+            account.status = STATUS.UNHEALTHY; account.lastError = error.message;
             return { success: true, healthy: false, error: error.message };
         }
     }
@@ -242,48 +241,29 @@ class AccountPool {
         var results = [];
         for (var i = 0; i < this.accounts.length; i++) {
             var account = this.accounts[i];
-            if (account.status === STATUS.DISABLED) {
-                results.push({ id: account.id, skipped: true, reason: 'disabled' });
-                continue;
-            }
+            if (account.status === STATUS.DISABLED) { results.push({ id: account.id, skipped: true, reason: 'disabled' }); continue; }
             try {
                 var result = await account.service.getUsageLimits();
                 var extracted = this._extractCredits(result);
                 account.lastUsage = { usedCount: extracted.used, limitCount: extracted.limit, checkedAt: new Date().toISOString() };
-                account.status = STATUS.HEALTHY;
-                account.lastError = null;
+                account.status = STATUS.HEALTHY; account.lastError = null;
                 results.push({ id: account.id, healthy: true, usedCount: extracted.used, limitCount: extracted.limit });
             } catch (error) {
-                account.status = STATUS.UNHEALTHY;
-                account.lastError = error.message;
+                account.status = STATUS.UNHEALTHY; account.lastError = error.message;
                 results.push({ id: account.id, healthy: false, error: error.message });
             }
         }
         return results;
     }
 
-    _findById(id) {
-        for (var i = 0; i < this.accounts.length; i++) { if (this.accounts[i].id === id) return this.accounts[i]; }
-        return null;
-    }
+    _findById(id) { for (var i = 0; i < this.accounts.length; i++) { if (this.accounts[i].id === id) return this.accounts[i]; } return null; }
 
     acquireAccount() {
         var account = this._selectBestAccount();
         if (!account) throw new Error(this.accounts.length === 0 ? 'No accounts configured.' : 'No healthy accounts available.');
-        account.activeRequests++;
-        account.lastUsedAt = new Date().toISOString();
-        account.totalRequests++;
-        var released = false;
-        var self = this;
-        return {
-            account: account,
-            release: function(error) {
-                if (released) return;
-                released = true;
-                account.activeRequests = Math.max(0, account.activeRequests - 1);
-                if (error) self._handleAccountError(account, error);
-            }
-        };
+        account.activeRequests++; account.lastUsedAt = new Date().toISOString(); account.totalRequests++;
+        var released = false; var self = this;
+        return { account: account, release: function(error) { if (released) return; released = true; account.activeRequests = Math.max(0, account.activeRequests - 1); if (error) self._handleAccountError(account, error); } };
     }
 
     _selectBestAccount() {
@@ -311,20 +291,18 @@ class AccountPool {
     async _backgroundRefresh(account) {
         if (account.status === STATUS.REFRESHING) return;
         account.status = STATUS.REFRESHING;
-        try { await account.service.loadCredentials(); await account.service.initializeAuth(true); account.status = STATUS.HEALTHY; account.lastError = null; logger.info('[Pool] Account ' + account.id + ' refreshed'); }
-        catch (error) { account.status = STATUS.UNHEALTHY; account.lastError = 'Refresh failed: ' + error.message; logger.error('[Pool] Refresh failed: ' + error.message); }
+        try { await account.service.loadCredentials(); await account.service.initializeAuth(true); account.status = STATUS.HEALTHY; account.lastError = null; }
+        catch (error) { account.status = STATUS.UNHEALTHY; account.lastError = 'Refresh failed: ' + error.message; }
     }
 
     startKeepAlive() {
-        if (this._keepAliveRunning) return;
-        this._keepAliveRunning = true;
+        if (this._keepAliveRunning) return; this._keepAliveRunning = true;
         for (var i = 0; i < this.accounts.length; i++) this._startAccountRefreshTimer(this.accounts[i]);
         logger.info('[Pool] Keep-alive started');
     }
 
     _startAccountRefreshTimer(account) {
-        var self = this;
-        if (account.refreshTimer) clearInterval(account.refreshTimer);
+        var self = this; if (account.refreshTimer) clearInterval(account.refreshTimer);
         account.refreshTimer = setInterval(async function() { if (account.status === STATUS.HEALTHY || account.status === STATUS.UNHEALTHY) { await self._backgroundRefresh(account); } }, this.refreshIntervalMs);
         if (account.refreshTimer.unref) account.refreshTimer.unref();
     }
@@ -337,32 +315,13 @@ class AccountPool {
     getStatuses() {
         var baseDir = process.env.DATA_DIR || process.cwd();
         return this.accounts.map(function(a) {
-            return {
-                id: a.id, label: a.label, status: a.status,
-                activeRequests: a.activeRequests, totalRequests: a.totalRequests,
-                totalErrors: a.totalErrors, lastError: a.lastError,
-                lastUsedAt: a.lastUsedAt, createdAt: a.createdAt,
-                credPath: a.credPath ? path.relative(baseDir, a.credPath) : null,
-                authMethod: (a.service && a.service.authMethod) || 'unknown',
-                region: (a.service && a.service.region) || 'unknown',
-                expiresAt: (a.service && a.service.expiresAt) || null,
-                lastUsage: a.lastUsage || null,
-            };
+            return { id: a.id, label: a.label, status: a.status, activeRequests: a.activeRequests, totalRequests: a.totalRequests, totalErrors: a.totalErrors, lastError: a.lastError, lastUsedAt: a.lastUsedAt, createdAt: a.createdAt, credPath: a.credPath ? path.relative(baseDir, a.credPath) : null, authMethod: (a.service && a.service.authMethod) || 'unknown', region: (a.service && a.service.region) || 'unknown', expiresAt: (a.service && a.service.expiresAt) || null, lastUsage: a.lastUsage || null };
         });
     }
 
     exportAllCredentials() {
         return this.accounts.map(function(a) {
-            return {
-                id: a.id, label: a.label,
-                credentials: {
-                    accessToken: a.service.accessToken, refreshToken: a.service.refreshToken,
-                    clientId: a.service.clientId || undefined, clientSecret: a.service.clientSecret || undefined,
-                    profileArn: a.service.profileArn || undefined, authMethod: a.service.authMethod,
-                    region: a.service.region, idcRegion: a.service.idcRegion || undefined,
-                    expiresAt: a.service.expiresAt,
-                },
-            };
+            return { id: a.id, label: a.label, credentials: { accessToken: a.service.accessToken, refreshToken: a.service.refreshToken, clientId: a.service.clientId || undefined, clientSecret: a.service.clientSecret || undefined, profileArn: a.service.profileArn || undefined, authMethod: a.service.authMethod, region: a.service.region, idcRegion: a.service.idcRegion || undefined, expiresAt: a.service.expiresAt } };
         });
     }
 
