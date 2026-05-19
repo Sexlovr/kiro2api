@@ -1,0 +1,31 @@
+{
+  "free": [
+    { "id": "claude-sonnet-4.6", "name": "Claude Sonnet 4.6", "context": "1M" },
+    { "id": "claude-sonnet-4.5", "name": "Claude Sonnet 4.5", "context": "200K" },
+    { "id": "claude-sonnet-4.0", "name": "Claude Sonnet 4.0", "context": "200K" },
+    { "id": "auto", "name": "Auto (Smart Router)", "context": "Dynamic" },
+    { "id": "glm-5", "name": "GLM-5", "context": "200K" },
+    { "id": "deepseek-3.2", "name": "DeepSeek 3.2", "context": "128K" },
+    { "id": "minimax-m2.5", "name": "MiniMax M2.5", "context": "200K" },
+    { "id": "minimax-m2.1", "name": "MiniMax M2.1", "context": "200K" },
+    { "id": "qwen3-coder-next", "name": "Qwen3 Coder Next", "context": "256K" }
+  ],
+  "paid": [
+    { "id": "claude-sonnet-4.6", "name": "Claude Sonnet 4.6", "context": "1M" },
+    { "id": "claude-sonnet-4.5", "name": "Claude Sonnet 4.5", "context": "200K" },
+    { "id": "claude-sonnet-4.0", "name": "Claude Sonnet 4.0", "context": "200K" },
+    { "id": "claude-haiku-4.5", "name": "Claude Haiku 4.5", "context": "200K" },
+    { "id": "claude-opus-4.5", "name": "Claude Opus 4.5", "context": "1M" },
+    { "id": "claude-opus-4.6", "name": "Claude Opus 4.6", "context": "1M" },
+    { "id": "claude-opus-4.7", "name": "Claude Opus 4.7", "context": "1M" }
+  ],
+  "model_mapping": {
+    "claude-sonnet-4-6": "claude-sonnet-4.6",
+    "claude-sonnet-4-5": "claude-sonnet-4.5",
+    "claude-sonnet-4-0": "claude-sonnet-4.0",
+    "claude-haiku-4-5": "claude-haiku-4.5",
+    "claude-opus-4-5": "claude-opus-4.5",
+    "claude-opus-4-6": "claude-opus-4.6",
+    "claude-opus-4-7": "claude-opus-4.7"
+  }
+}
